@@ -2,7 +2,8 @@ import time
 
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar,
                              QPushButton, QMessageBox, QDialog, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QDialogButtonBox, QPlainTextEdit)
+                             QTableWidgetItem, QHeaderView, QDialogButtonBox, QPlainTextEdit,
+                             QSizePolicy)
 from PyQt6.QtCore import (
     Qt, pyqtSlot, QThreadPool, pyqtSignal, QPropertyAnimation, QEasingCurve, pyqtProperty, QBuffer,
     QIODevice, QRectF,
@@ -61,11 +62,18 @@ class ElidedLabel(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(parent)
         self._text = text
-        self.setWordWrap(True)  
+        # Queue rows must not feed wrapped text height back into the
+        # QScrollArea's width calculation (Qt 6.11 layout recursion).
+        self.setWordWrap(False)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setToolTip(text)
         self.updateText()
 
     def setText(self, text):
         self._text = text
+        self.setToolTip(text)
         self.updateText()
 
     def resizeEvent(self, event):
@@ -75,7 +83,8 @@ class ElidedLabel(QLabel):
     def updateText(self):
         metrics = QFontMetrics(self.font())
         elided = metrics.elidedText(self._text, Qt.TextElideMode.ElideRight, self.width())
-        super().setText(elided)
+        if super().text() != elided:
+            super().setText(elided)
 
 PROGRESS_BAR_STYLESHEET = """
 QProgressBar {
@@ -231,8 +240,7 @@ class DownloadJobWidget(QWidget):
         
         top_row_layout.addLayout(counts_layout)
         
-        self.status_label = QLabel("Queued...")
-        self.status_label.setWordWrap(True)
+        self.status_label = ElidedLabel("Queued...")
         self.status_label.setStyleSheet("font-size: 8pt;")
         
         self.stream_label = QLabel("Stream: -")

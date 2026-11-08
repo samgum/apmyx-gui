@@ -20,7 +20,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 import m3u8
@@ -58,11 +58,55 @@ def _make_progressive(part_path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _inherit_media_access_key(url: str, playlist_url: str) -> str:
+    """Carry Apple's playlist accessKey to same-origin media requests only.
+
+    Relative segment URIs omit this parameter on current Apple MV playlists.
+    urljoin correctly drops a parent's query; the CDN nevertheless requires
+    this particular authorization parameter on each media segment.
+    """
+    target = urlsplit(urljoin(playlist_url, url))
+    parent = urlsplit(playlist_url)
+    if (target.scheme, target.hostname, target.port or 443) != (parent.scheme, parent.hostname, parent.port or 443) or target.scheme != "https":
+        return urlunsplit(target)
+    if any(key == "accessKey" for key, _ in parse_qsl(target.query, keep_blank_values=True)):
+        return urlunsplit(target)
+    key = next((value for name, value in parse_qsl(parent.query, keep_blank_values=True) if name == "accessKey"), None)
+    if not key:
+        return urlunsplit(target)
+    addition = urlencode({"accessKey": key})
+    query = target.query + "&" + addition if target.query else addition
+    return urlunsplit(target._replace(query=query))
+
+
+def _parse_media_playlist(text: str, playlist_url: str):
+    media = m3u8.loads(text, uri=playlist_url)
+    for segment in media.segments:
+        segment.uri = _inherit_media_access_key(segment.absolute_uri, playlist_url)
+    return media
+
+
+def _redact_media_http_error(error: Exception) -> None:
+    """Keep signed CDN query parameters out of error messages and requests."""
+    if not isinstance(error, httpx.HTTPError):
+        return
+    message = str(error)
+    try:
+        request = error.request
+        original = str(request.url)
+        request.url = request.url.copy_with(query=None)
+        message = message.replace(original, str(request.url))
+    except (RuntimeError, AttributeError):
+        pass
+    message = re.sub(r"(?i)([?&]accessKey=)[^\s'\"&<>]+", r"\1[REDACTED]", message)
+    error.args = (message,)
+
+
 def _find_map_url(media_playlist_txt: str, base_url: str) -> str:
     m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', media_playlist_txt)
     if not m:
         raise RuntimeError("MV media playlist has no #EXT-X-MAP init segment")
-    return urljoin(base_url, m.group(1))
+    return _inherit_media_access_key(m.group(1), base_url)
 
 
 def _find_widevine_key(media) -> Optional[str]:
@@ -219,9 +263,10 @@ class MVRipper:
             else:
                 logger.logger.warning("No audio stream found, saving video only")
 
-            v_txt = await it(WebAPI).download_m3u8(vv.absolute_uri)
-            v_media = m3u8.loads(v_txt, uri=vv.absolute_uri)
-            v_init_url = _find_map_url(v_txt, vv.absolute_uri)
+            v_playlist_url = _inherit_media_access_key(vv.absolute_uri, master_url)
+            v_txt = await it(WebAPI).download_m3u8(v_playlist_url)
+            v_media = _parse_media_playlist(v_txt, v_playlist_url)
+            v_init_url = _find_map_url(v_txt, v_playlist_url)
             if use_playready:
                 v_key = _find_playready_key(v_media)
                 if v_key is None:
@@ -233,9 +278,10 @@ class MVRipper:
 
             a_media = a_init_url = a_key = None
             if audio_alt is not None:
-                a_txt = await it(WebAPI).download_m3u8(audio_alt.absolute_uri)
-                a_media = m3u8.loads(a_txt, uri=audio_alt.absolute_uri)
-                a_init_url = _find_map_url(a_txt, audio_alt.absolute_uri)
+                a_playlist_url = _inherit_media_access_key(audio_alt.absolute_uri, master_url)
+                a_txt = await it(WebAPI).download_m3u8(a_playlist_url)
+                a_media = _parse_media_playlist(a_txt, a_playlist_url)
+                a_init_url = _find_map_url(a_txt, a_playlist_url)
                 a_key = _find_widevine_key(a_media)
                 if a_key is None:
                     raise RuntimeError("MV audio stream has no Widevine key")
@@ -277,6 +323,7 @@ class MVRipper:
                                                  save_cover_file=not as_track)
             logger.saved()
         except Exception as e:
+            _redact_media_http_error(e)
             logger.logger.exception(f"Failed to download music video: {e}")
             try:
                 from applemusicdecrypt.services import it as _it
